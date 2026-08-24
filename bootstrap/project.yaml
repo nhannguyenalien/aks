@@ -1,0 +1,22 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: schoolsai
+  namespace: argocd
+spec:
+  description: SchoolsAI applications managed through reviewed Git commits
+  sourceRepos:
+    - REPLACE_WITH_GIT_REPOSITORY_URL
+  destinations:
+    - namespace: schoolsai-*
+      server: https://kubernetes.default.svc
+    - namespace: external-dns
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+  orphanedResources:
+    warn: true
