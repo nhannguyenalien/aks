@@ -1,0 +1,94 @@
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: kube-prometheus-stack
+  namespace: kube-system
+spec:
+  repo: https://prometheus-community.github.io/helm-charts
+  chart: kube-prometheus-stack
+  version: 88.5.4
+  targetNamespace: monitoring
+  createNamespace: true
+  valuesContent: |-
+    fullnameOverride: monitoring
+    defaultRules:
+      create: true
+    kubeEtcd:
+      enabled: false
+    kubeControllerManager:
+      enabled: false
+    kubeScheduler:
+      enabled: false
+    grafana:
+      admin:
+        existingSecret: grafana-admin
+        userKey: admin-user
+        passwordKey: admin-password
+      defaultDashboardsEnabled: true
+      persistence:
+        enabled: true
+        storageClassName: local-path
+        size: 5Gi
+      ingress:
+        enabled: true
+        ingressClassName: traefik
+        hosts:
+          - grafana-vps.schoolsai.work
+        path: /
+      nodeSelector:
+        kubernetes.io/hostname: k3s-promox
+      resources:
+        requests:
+          cpu: 100m
+          memory: 256Mi
+        limits:
+          cpu: 500m
+          memory: 768Mi
+    prometheus:
+      prometheusSpec:
+        retention: 7d
+        retentionSize: 12GB
+        nodeSelector:
+          kubernetes.io/hostname: k3s-pve
+        resources:
+          requests:
+            cpu: 300m
+            memory: 1Gi
+          limits:
+            cpu: "2"
+            memory: 2Gi
+        storageSpec:
+          volumeClaimTemplate:
+            spec:
+              storageClassName: local-path
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 15Gi
+    alertmanager:
+      alertmanagerSpec:
+        nodeSelector:
+          kubernetes.io/hostname: k3s-pve
+        resources:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 300m
+            memory: 384Mi
+        storage:
+          volumeClaimTemplate:
+            spec:
+              storageClassName: local-path
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                requests:
+                  storage: 2Gi
+    prometheusOperator:
+      resources:
+        requests:
+          cpu: 50m
+          memory: 128Mi
+        limits:
+          cpu: 300m
+          memory: 384Mi

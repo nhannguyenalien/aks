@@ -9,6 +9,10 @@ objects directly to Kubernetes.
 - `bootstrap/`: Argo CD projects and root applications.
 - `platform/`: shared platform components such as ExternalDNS.
 - `apps/`: application manifests generated from approved service blueprints.
+- `docs/`: operator and API usage documentation.
+
+Start with [`docs/OPERATIONS.md`](docs/OPERATIONS.md) and
+[`docs/API_EXAMPLE.md`](docs/API_EXAMPLE.md).
 
 ## Deployment workflow
 
