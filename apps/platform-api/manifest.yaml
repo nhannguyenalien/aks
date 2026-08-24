@@ -1,0 +1,660 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo-api
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-api-source
+  namespace: demo-api
+data:
+  app.py: |
+    import os
+    import re
+    import secrets
+    import socket
+    import hashlib
+    import logging
+    import pathlib
+    import subprocess
+    import tempfile
+    import time
+    from datetime import datetime, timezone
+    from typing import Annotated, Any, Literal
+
+    from fastapi import Depends, FastAPI, HTTPException, Request, status
+    from fastapi.responses import JSONResponse
+    from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+    from pydantic import BaseModel, Field, model_validator
+    import yaml
+
+    API_DESCRIPTION = """
+    # SchoolsAI Service Blueprint API
+
+    This reference API is both **executable documentation** and a contract for
+    developers or AI agents that need to describe services deployed to this K3s
+    cluster.
+
+    ## Cluster topology
+
+    | Role | Node | Node IP |
+    |---|---|---|
+    | Control plane | `k3s-promox` | `192.168.1.110` |
+    | Worker | `k3s-pve` | `192.168.2.110` |
+
+    Public traffic follows this path:
+
+    `Cloudflare -> cloudflared -> Traefik -> Ingress -> Service -> Pods`
+
+    ## API conventions
+
+    * Product endpoints are versioned under `/api/v1`.
+    * JSON property names use `snake_case`.
+    * Dates use ISO 8601 UTC.
+    * Workload names must be DNS labels: lowercase letters, digits and `-`.
+    * Every production workload should expose a health endpoint.
+    * Errors use one stable envelope containing `code`, `message`, `details`
+      and `request_id`.
+
+    ## Workflow for an AI agent
+
+    1. Read `GET /api/v1/capabilities`.
+    2. Build a `ServiceBlueprint` using the schema and examples below.
+    3. Call `POST /api/v1/service-blueprints/validate`.
+    4. Call `POST /api/v1/service-blueprints/render` and review the planned
+       Kubernetes objects.
+    5. Ask for explicit deployment authorization. The public API intentionally
+       has no endpoint that applies manifests to the cluster.
+
+    ## Authentication
+
+    Demo endpoints are currently public. Before adding mutation endpoints,
+    protect the hostname with Cloudflare Access and require a scoped service
+    token. Never put Kubernetes credentials in request bodies.
+    """
+
+    tags_metadata = [
+        {"name": "Discovery", "description": "Human- and machine-readable API entry points."},
+        {"name": "Operations", "description": "Liveness, readiness and runtime metadata."},
+        {"name": "Service Blueprints", "description": "Validate and render a safe deployment plan without applying it."},
+    ]
+
+    app = FastAPI(
+        title="SchoolsAI Service Blueprint API",
+        summary="Reference contract for building services on the SchoolsAI K3s cluster",
+        description=API_DESCRIPTION,
+        version="1.1.0",
+        contact={"name": "SchoolsAI Platform Team"},
+        license_info={"name": "Internal use"},
+        openapi_tags=tags_metadata,
+        docs_url="/docs",
+        redoc_url="/redoc",
+        openapi_url="/openapi.json",
+    )
+
+    app.openapi_schema = None
+    original_openapi = app.openapi
+
+    def custom_openapi():
+        if app.openapi_schema:
+            return app.openapi_schema
+        schema = original_openapi()
+        schema["info"]["x-ai-agent-instructions"] = {
+            "purpose": "Describe and validate a Kubernetes service before deployment",
+            "safe_default": "Call validate and render only; never assume apply authorization",
+            "required_sequence": ["capabilities", "validate", "render", "human approval"],
+        }
+        schema["servers"] = [{"url": "https://api-vps.schoolsai.work", "description": "Production tunnel"}]
+        app.openapi_schema = schema
+        return schema
+
+    app.openapi = custom_openapi
+
+    audit_logger = logging.getLogger("uvicorn.error")
+
+    @app.middleware("http")
+    async def audit_requests(request: Request, call_next):
+        started = time.monotonic()
+        response = await call_next(request)
+        if request.url.path.startswith("/api/v1/"):
+            authorization = request.headers.get("authorization", "")
+            key_fingerprint = "anonymous"
+            if authorization.lower().startswith("bearer "):
+                key_fingerprint = hashlib.sha256(authorization[7:].encode()).hexdigest()[:12]
+            audit_logger.info(
+                "audit method=%s path=%s status=%s duration_ms=%s key_fp=%s request_id=%s client=%s",
+                request.method,
+                request.url.path,
+                response.status_code,
+                round((time.monotonic() - started) * 1000),
+                key_fingerprint,
+                request.headers.get("cf-ray", socket.gethostname()),
+                request.headers.get("cf-connecting-ip", request.client.host if request.client else "unknown"),
+            )
+        return response
+
+    bearer_scheme = HTTPBearer(
+        bearerFormat="API key",
+        description="Enter the SchoolsAI API key. The client sends it as `Authorization: Bearer <key>`.",
+        auto_error=False,
+    )
+    deploy_key_scheme = APIKeyHeader(
+        name="X-Deploy-Key",
+        description="Additional high-privilege key required for GitOps write operations.",
+        auto_error=False,
+    )
+
+    def require_api_key(
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    ) -> str:
+        expected = os.getenv("API_KEY", "")
+        if (
+            not expected
+            or credentials is None
+            or credentials.scheme.lower() != "bearer"
+            or not secrets.compare_digest(credentials.credentials, expected)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Missing or invalid API key.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return credentials.credentials
+
+    def require_deploy_key(deploy_key: str | None = Depends(deploy_key_scheme)) -> str:
+        expected = os.getenv("DEPLOY_API_KEY", "")
+        if not expected or deploy_key is None or not secrets.compare_digest(deploy_key, expected):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Missing or invalid deploy key.",
+            )
+        return deploy_key
+
+    class ErrorBody(BaseModel):
+        code: str = Field(examples=["VALIDATION_ERROR"])
+        message: str = Field(examples=["The request could not be processed."])
+        details: list[dict[str, Any]] = Field(default_factory=list)
+        request_id: str | None = Field(default=None, examples=["demo-api-abc123"])
+
+    class HealthResponse(BaseModel):
+        status: Literal["ok"]
+        timestamp: datetime
+        node: str
+        pod: str
+        version: str
+
+    class EnvironmentVariable(BaseModel):
+        name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Z_][A-Z0-9_]*$", examples=["LOG_LEVEL"])
+        value: str = Field(max_length=4096, examples=["info"])
+
+    class ResourceRequirements(BaseModel):
+        cpu_request: str = Field(default="100m", examples=["100m"])
+        memory_request: str = Field(default="128Mi", examples=["128Mi"])
+        cpu_limit: str = Field(default="1", examples=["1"])
+        memory_limit: str = Field(default="512Mi", examples=["512Mi"])
+
+    class ServiceBlueprint(BaseModel):
+        """Portable description of an HTTP service intended for this cluster."""
+
+        name: str = Field(
+            min_length=2,
+            max_length=63,
+            pattern=r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$",
+            description="Kubernetes DNS-label name.",
+            examples=["student-api"],
+        )
+        namespace: str = Field(
+            default="schoolsai-app",
+            pattern=r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$",
+            examples=["schoolsai"],
+        )
+        image: str = Field(
+            min_length=3,
+            max_length=255,
+            description="Immutable image tag or digest is recommended.",
+            examples=["ghcr.io/schoolsai/student-api:1.4.2"],
+        )
+        container_port: int = Field(ge=1, le=65535, examples=[8000])
+        replicas: int = Field(default=2, ge=1, le=10, description="Use at least two replicas for node-level availability.")
+        hostname: str = Field(
+            pattern=r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$",
+            examples=["student-vps.schoolsai.work"],
+        )
+        health_path: str = Field(default="/health", pattern=r"^/", examples=["/health"])
+        public: bool = Field(default=True, description="Whether an Internet-facing Ingress should be planned.")
+        registry_secret_name: str | None = Field(
+            default=None,
+            pattern=r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$",
+            description="Existing docker-registry Secret in the same namespace; credentials are never accepted in a blueprint.",
+            examples=["ghcr-pull-secret"],
+        )
+        environment: list[EnvironmentVariable] = Field(default_factory=list)
+        resources: ResourceRequirements = Field(default_factory=ResourceRequirements)
+
+        @model_validator(mode="after")
+        def validate_hostname(self):
+            if self.public and not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?-vps\.schoolsai\.work", self.hostname):
+                raise ValueError("public hostname must follow <service>-vps.schoolsai.work")
+            if self.image.endswith(":latest"):
+                raise ValueError("image tag 'latest' is not allowed; use a version or digest")
+            expected_namespace = f"schoolsai-{self.name}"
+            if self.namespace != expected_namespace:
+                raise ValueError(f"namespace must be {expected_namespace}")
+            return self
+
+        model_config = {
+            "json_schema_extra": {
+                "examples": [{
+                    "name": "student-api",
+                    "namespace": "schoolsai-student-api",
+                    "image": "ghcr.io/schoolsai/student-api:1.4.2",
+                    "container_port": 8000,
+                    "replicas": 2,
+                    "hostname": "student-vps.schoolsai.work",
+                    "health_path": "/health",
+                    "public": True,
+                    "registry_secret_name": "ghcr-pull-secret",
+                    "environment": [{"name": "LOG_LEVEL", "value": "info"}],
+                    "resources": {
+                        "cpu_request": "100m",
+                        "memory_request": "128Mi",
+                        "cpu_limit": "1",
+                        "memory_limit": "512Mi"
+                    }
+                }]
+            }
+        }
+
+    class ValidationResponse(BaseModel):
+        valid: bool
+        warnings: list[str]
+        normalized_blueprint: ServiceBlueprint
+
+    class RenderResponse(BaseModel):
+        api_version: Literal["schoolsai.work/v1"] = "schoolsai.work/v1"
+        apply_allowed: Literal[False] = False
+        review_required: Literal[True] = True
+        resources: list[dict[str, Any]]
+        next_steps: list[str]
+
+    class DeploymentResponse(BaseModel):
+        status: Literal["committed", "unchanged"]
+        service: str
+        namespace: str
+        hostname: str
+        git_revision: str
+        repository: str
+        argocd_application: str = "schoolsai-apps"
+        message: str
+
+    @app.exception_handler(HTTPException)
+    async def http_error_handler(request: Request, exc: HTTPException):
+        body = ErrorBody(
+            code="HTTP_ERROR",
+            message=str(exc.detail),
+            request_id=request.headers.get("cf-ray") or socket.gethostname(),
+        )
+        return JSONResponse(status_code=exc.status_code, content=body.model_dump(mode="json"))
+
+    @app.get("/", tags=["Discovery"], summary="API discovery document")
+    def root():
+        return {
+            "name": "SchoolsAI Service Blueprint API",
+            "version": "1.1.0",
+            "documentation": "/docs",
+            "alternative_documentation": "/redoc",
+            "openapi": "/openapi.json",
+            "health": "/health/ready",
+            "node": os.getenv("NODE_NAME", "unknown"),
+            "pod": socket.gethostname(),
+        }
+
+    @app.get("/health", include_in_schema=False)
+    @app.get("/health/live", response_model=HealthResponse, tags=["Operations"], summary="Liveness probe")
+    def liveness():
+        return HealthResponse(
+            status="ok",
+            timestamp=datetime.now(timezone.utc),
+            node=os.getenv("NODE_NAME", "unknown"),
+            pod=socket.gethostname(),
+            version="1.1.0",
+        )
+
+    @app.get("/health/ready", response_model=HealthResponse, tags=["Operations"], summary="Readiness probe")
+    def readiness():
+        return liveness()
+
+    @app.get("/api/v1/capabilities", tags=["Discovery"], summary="Get platform capabilities")
+    def capabilities(_api_key: str = Depends(require_api_key)):
+        return {
+            "api_version": "v1",
+            "operations": ["validate_service_blueprint", "render_kubernetes_plan", "commit_gitops_deployment"],
+            "deployment_apply_enabled": False,
+            "ingress_class": "traefik",
+            "public_hostname_pattern": "<service>-vps.schoolsai.work",
+            "default_replicas": 2,
+            "cluster_nodes": ["k3s-promox", "k3s-pve"],
+            "network_backend": "wireguard-native",
+            "requirements": [
+                "versioned container image",
+                "HTTP health endpoint",
+                "resource requests and limits",
+                "human approval before apply",
+                "private images reference a pre-created docker-registry Secret",
+            ],
+        }
+
+    def warnings_for(blueprint: ServiceBlueprint) -> list[str]:
+        warnings = []
+        if blueprint.replicas < 2:
+            warnings.append("A single replica does not tolerate a node outage.")
+        if not re.search(r"(:[0-9]+(?:\.[0-9]+){1,2}$)|(@sha256:)", blueprint.image):
+            warnings.append("Prefer a semantic version tag or sha256 digest for reproducible deployments.")
+        if blueprint.environment:
+            warnings.append("Do not place secrets in environment values; reference Kubernetes Secrets instead.")
+        return warnings
+
+    def build_resources(blueprint: ServiceBlueprint) -> list[dict[str, Any]]:
+        labels = {"app.kubernetes.io/name": blueprint.name, "app.kubernetes.io/managed-by": "schoolsai-blueprint"}
+        container = {
+            "name": blueprint.name,
+            "image": blueprint.image,
+            "ports": [{"name": "http", "containerPort": blueprint.container_port}],
+            "env": [item.model_dump() for item in blueprint.environment],
+            "readinessProbe": {"httpGet": {"path": blueprint.health_path, "port": "http"}},
+            "livenessProbe": {"httpGet": {"path": blueprint.health_path, "port": "http"}},
+            "resources": {
+                "requests": {"cpu": blueprint.resources.cpu_request, "memory": blueprint.resources.memory_request},
+                "limits": {"cpu": blueprint.resources.cpu_limit, "memory": blueprint.resources.memory_limit},
+            },
+        }
+        resources: list[dict[str, Any]] = [
+            {
+                "apiVersion": "v1", "kind": "Namespace",
+                "metadata": {"name": blueprint.namespace, "labels": {"schoolsai.work/managed": "true"}},
+            },
+            {
+                "apiVersion": "apps/v1", "kind": "Deployment",
+                "metadata": {"name": blueprint.name, "namespace": blueprint.namespace, "labels": labels},
+                "spec": {
+                    "replicas": blueprint.replicas,
+                    "selector": {"matchLabels": labels},
+                    "template": {
+                        "metadata": {"labels": labels},
+                        "spec": {
+                            "containers": [container],
+                            **(
+                                {"imagePullSecrets": [{"name": blueprint.registry_secret_name}]}
+                                if blueprint.registry_secret_name else {}
+                            ),
+                        },
+                    },
+                },
+            },
+            {
+                "apiVersion": "v1", "kind": "Service",
+                "metadata": {"name": blueprint.name, "namespace": blueprint.namespace, "labels": labels},
+                "spec": {"selector": labels, "ports": [{"name": "http", "port": 80, "targetPort": "http"}]},
+            },
+        ]
+        if blueprint.public:
+            resources.append({
+                "apiVersion": "networking.k8s.io/v1", "kind": "Ingress",
+                "metadata": {"name": blueprint.name, "namespace": blueprint.namespace, "labels": labels},
+                "spec": {
+                    "ingressClassName": "traefik",
+                    "rules": [{"host": blueprint.hostname, "http": {"paths": [{
+                        "path": "/", "pathType": "Prefix",
+                        "backend": {"service": {"name": blueprint.name, "port": {"number": 80}}},
+                    }]}}],
+                },
+            })
+        return resources
+
+    @app.post(
+        "/api/v1/service-blueprints/validate",
+        response_model=ValidationResponse,
+        tags=["Service Blueprints"],
+        summary="Validate a service blueprint",
+        description="Performs schema and platform-policy validation. It does not contact or modify Kubernetes.",
+        status_code=status.HTTP_200_OK,
+    )
+    def validate_blueprint(blueprint: ServiceBlueprint, _api_key: str = Depends(require_api_key)):
+        return ValidationResponse(
+            valid=True,
+            warnings=warnings_for(blueprint),
+            normalized_blueprint=blueprint,
+        )
+
+    @app.post(
+        "/api/v1/service-blueprints/render",
+        response_model=RenderResponse,
+        tags=["Service Blueprints"],
+        summary="Render a Kubernetes deployment plan",
+        description="Returns Deployment, Service and optional Ingress objects as JSON. Review is mandatory; nothing is applied.",
+    )
+    def render_blueprint(blueprint: ServiceBlueprint, _api_key: str = Depends(require_api_key)):
+        resources = build_resources(blueprint)
+        return RenderResponse(
+            resources=resources,
+            next_steps=[
+                "Review image provenance, resources, environment and hostname.",
+                "Create secrets separately; never embed secret values in this blueprint.",
+                "Obtain explicit deployment approval.",
+                "Apply through an authenticated CI/CD or GitOps workflow.",
+                "Verify rollout, health, DNS and rollback procedure.",
+            ],
+        )
+
+    def run_git(arguments: list[str], cwd: pathlib.Path) -> str:
+        environment = os.environ.copy()
+        environment["GIT_SSH_COMMAND"] = (
+            "ssh -i /var/run/gitops/id_ed25519 -o IdentitiesOnly=yes "
+            "-o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/tmp/github_known_hosts"
+        )
+        result = subprocess.run(
+            ["git", *arguments], cwd=cwd, env=environment,
+            text=True, capture_output=True, timeout=90,
+        )
+        if result.returncode != 0:
+            audit_logger.error("git operation failed command=%s stderr=%s", arguments[0], result.stderr[-500:])
+            raise HTTPException(status_code=502, detail="GitOps repository operation failed.")
+        return result.stdout.strip()
+
+    @app.post(
+        "/api/v1/deployments",
+        response_model=DeploymentResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+        tags=["Service Blueprints"],
+        summary="Commit an approved service deployment to GitOps",
+        description="Requires both Bearer authentication and X-Deploy-Key. Commits desired state to Git; Argo CD performs the Kubernetes sync.",
+    )
+    def deploy_blueprint(
+        blueprint: ServiceBlueprint,
+        _api_key: str = Depends(require_api_key),
+        _deploy_key: str = Depends(require_deploy_key),
+    ):
+        repository = os.getenv("GIT_REPOSITORY", "git@github.com:nhannguyenalien/aks.git")
+        with tempfile.TemporaryDirectory(prefix="schoolsai-gitops-") as temporary:
+            checkout = pathlib.Path(temporary)
+            run_git(["clone", "--depth", "1", "--branch", "main", repository, "."], checkout)
+            service_directory = checkout / "apps" / blueprint.name
+            service_directory.mkdir(parents=True, exist_ok=True)
+            manifest = yaml.safe_dump_all(build_resources(blueprint), sort_keys=False)
+            (service_directory / "manifest.yaml").write_text(manifest)
+            (service_directory / "kustomization.yaml").write_text(
+                "apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nresources:\n  - manifest.yaml\n"
+            )
+            root_kustomization = checkout / "apps" / "kustomization.yaml"
+            root_data = yaml.safe_load(root_kustomization.read_text()) or {}
+            root_resources = root_data.setdefault("resources", [])
+            relative_service = blueprint.name
+            if relative_service not in root_resources:
+                root_resources.append(relative_service)
+                root_resources.sort()
+            root_kustomization.write_text(yaml.safe_dump(root_data, sort_keys=False))
+            run_git(["config", "user.name", "SchoolsAI Deploy API"], checkout)
+            run_git(["config", "user.email", "deploy-api@schoolsai.work"], checkout)
+            run_git(["add", f"apps/{blueprint.name}", "apps/kustomization.yaml"], checkout)
+            diff = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=checkout)
+            if diff.returncode == 0:
+                revision = run_git(["rev-parse", "HEAD"], checkout)
+                deploy_status = "unchanged"
+                message = "Desired state already matches Git."
+            else:
+                run_git(["commit", "-m", f"Deploy {blueprint.name} ({blueprint.image})"], checkout)
+                run_git(["push", "origin", "HEAD:main"], checkout)
+                revision = run_git(["rev-parse", "HEAD"], checkout)
+                deploy_status = "committed"
+                message = "Committed successfully; Argo CD will reconcile the deployment."
+            return DeploymentResponse(
+                status=deploy_status,
+                service=blueprint.name,
+                namespace=blueprint.namespace,
+                hostname=blueprint.hostname,
+                git_revision=revision,
+                repository=repository,
+                message=message,
+            )
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-api
+  namespace: demo-api
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  selector:
+    matchLabels:
+      app: demo-api
+  template:
+    metadata:
+      labels:
+        app: demo-api
+    spec:
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: demo-api
+              topologyKey: kubernetes.io/hostname
+      containers:
+        - name: api
+          image: python:3.12-slim
+          command: ["/bin/sh", "-c"]
+          args:
+            - apt-get update && apt-get install -y --no-install-recommends git openssh-client && rm -rf /var/lib/apt/lists/* && pip install --no-cache-dir fastapi==0.141.1 uvicorn==0.52.4 PyYAML==6.0.3 && exec uvicorn app:app --host 0.0.0.0 --port 8000
+          workingDir: /app
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: demo-api-auth
+                  key: api-key
+            - name: DEPLOY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: demo-api-auth
+                  key: deploy-key
+            - name: GIT_REPOSITORY
+              value: git@github.com:nhannguyenalien/aks.git
+          ports:
+            - name: http
+              containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          volumeMounts:
+            - name: source
+              mountPath: /app/app.py
+              subPath: app.py
+              readOnly: true
+            - name: gitops-key
+              mountPath: /var/run/gitops
+              readOnly: true
+      volumes:
+        - name: source
+          configMap:
+            name: demo-api-source
+        - name: gitops-key
+          secret:
+            secretName: demo-api-gitops-key
+            defaultMode: 0400
+            items:
+              - key: ssh-private-key
+                path: id_ed25519
+      automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-api
+  namespace: demo-api
+spec:
+  selector:
+    app: demo-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demo-api
+  namespace: demo-api
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: api-vps.schoolsai.work
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-api
+                port:
+                  number: 80
+    - host: apik3s.schoolsai.work
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: demo-api
+                port:
+                  number: 80

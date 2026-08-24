@@ -8,6 +8,8 @@ spec:
   sourceRepos:
     - git@github.com:nhannguyenalien/aks.git
   destinations:
+    - namespace: demo-api
+      server: https://kubernetes.default.svc
     - namespace: schoolsai-*
       server: https://kubernetes.default.svc
     - namespace: external-dns
