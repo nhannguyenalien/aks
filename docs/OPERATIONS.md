@@ -67,6 +67,27 @@ Argo CD self-heal is enabled; manual cluster edits will be reverted.
 Monitoring data uses node-local volumes. It survives pod restarts but not loss
 of the Proxmox node or its storage.
 
+## AnythingLLM
+
+- URL: `https://anythingllm-vps.schoolsai.work`
+- Namespace: `schoolsai-anythingllm`
+- Image: `mintplexlabs/anythingllm:1.16.0`
+- Runtime: one replica pinned to `k3s-pve`.
+- Persistent storage: 10 GiB local-path PVC mounted at
+  `/app/server/storage`.
+- Health endpoint: `/api/ping`.
+
+AnythingLLM uses stateful local storage, so its deployment strategy is
+`Recreate`; do not scale it horizontally without first moving its database and
+storage to a multi-instance architecture. The first visitor completes the
+AnythingLLM setup wizard and creates the administrator account. Provider API
+keys entered in AnythingLLM are application data and must never be committed
+to this repository.
+
+The PVC is node-local on `k3s-pve`. Include its underlying local-path data in
+application-volume backups; the K3s datastore backup alone does not contain
+the files stored in the PVC.
+
 ## Secret policy
 
 - Never commit API, deploy, registry, Cloudflare or Git private keys.
