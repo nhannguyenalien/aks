@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily off-host K3s backup pull
+
+[Timer]
+OnCalendar=*-*-* 03:35:00
+Persistent=true
+RandomizedDelaySec=10m
+Unit=pull-k3s-backup.service
+
+[Install]
+WantedBy=timers.target

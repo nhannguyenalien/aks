@@ -1,0 +1,8 @@
+[Unit]
+Description=Pull K3s datastore backup to the second Proxmox host
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pull-k3s-backup

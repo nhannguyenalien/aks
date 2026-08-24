@@ -1,0 +1,11 @@
+[Unit]
+Description=Create a consistent K3s SQLite datastore backup
+After=k3s.service
+Requires=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/k3s-datastore-backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily K3s datastore backup
+
+[Timer]
+# 03:15 Asia/Ho_Chi_Minh (the Ubuntu VM itself uses UTC)
+OnCalendar=*-*-* 20:15:00 UTC
+Persistent=true
+RandomizedDelaySec=10m
+Unit=k3s-datastore-backup.service
+
+[Install]
+WantedBy=timers.target

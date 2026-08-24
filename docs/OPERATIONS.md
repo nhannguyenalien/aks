@@ -85,3 +85,32 @@ Required backup assets:
 
 A local datastore backup is not an off-site backup. Copy backups to storage
 outside `k3s-promox` and test restore regularly.
+
+### Installed schedule
+
+- `k3s-promox` VM: consistent SQLite backup daily at approximately 03:15 ICT
+  (`20:15 UTC` on the VM timer).
+- `pve` physical host: pull to `/mnt/pve/hdd4tb/k3s-backups` at approximately
+  03:35.
+- Local retention: 14 days; second-host retention: 30 days.
+- Every backup runs SQLite `PRAGMA integrity_check` and creates SHA-256 data.
+
+Inspect timers and recent logs:
+
+```sh
+systemctl list-timers 'k3s-*'
+journalctl -u k3s-datastore-backup.service
+journalctl -u pull-k3s-backup.service
+```
+
+### Datastore restore outline
+
+1. Provision the same K3s version and preserve the server token.
+2. Stop `k3s`.
+3. Preserve the failed `/var/lib/rancher/k3s/server/db` directory separately.
+4. Extract the verified archive and restore `state.db` and `token` with root-only
+   permissions.
+5. Start `k3s`, verify nodes/workloads, then verify Argo CD reconciliation.
+
+Perform restore testing on a disposable VM. Do not test restoration against the
+live control-plane.
